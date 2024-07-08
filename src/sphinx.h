@@ -332,6 +332,13 @@ std::unique_ptr<ISphFieldFilter> sphCreateFilterICU ( std::unique_ptr<ISphFieldF
 // SEARCH QUERIES
 /////////////////////////////////////////////////////////////////////////////
 
+enum class EStrCmpDir
+{
+	EQ,
+	LT,
+	GT
+};
+
 /// search query filter
 struct CommonFilterSettings_t
 {
@@ -352,6 +359,7 @@ struct CommonFilterSettings_t
 	bool				m_bOpenLeft = false;
 	bool				m_bOpenRight = false;
 	bool				m_bExclude = false;		///< whether this is "include" or "exclude" filter (default is "include")
+	EStrCmpDir			m_eStrCmpDir = EStrCmpDir::EQ;		///< string comparison direction
 };
 
 
@@ -504,6 +512,7 @@ struct CSphQuery
 
 	CSphString		m_sKNNAttr;					///< which attr to use for KNN search (enables KNN if not empty)
 	int				m_iKNNK = 0;				///< KNN K
+	int				m_iKnnEf = 0;				///< KNN ef
 	CSphVector<float> m_dKNNVec;				///< KNN anchor vector
 
 	bool			m_bSortKbuffer = false;		///< whether to use PQ or K-buffer sorting algorithm
@@ -918,6 +927,7 @@ struct CSphIndexStatus
 	int64_t			m_iSavedTID = 0;
 	int64_t 		m_iDead = 0;
 	double			m_fSaveRateLimit {0.0};	 // not used for plain. Part of m_iMemLimit to be achieved before flushing
+	int 			m_iLockCount = 0;		// not used for plain. N of active locks (i.e. - if N>0, saving is prohibited)
 };
 
 
@@ -981,6 +991,7 @@ private:
 public:
 	virtual int			Kill ( DocID_t  /*tDocID*/ ) { return 0; }
 	virtual int			KillMulti ( const VecTraits_T<DocID_t> &  /*dKlist*/ ) { return 0; };
+	virtual int 		KillDupes () { return 0; }
 	virtual int			CheckThenKillMulti ( const VecTraits_T<DocID_t>& dKlist, BlockerFn&& /*fnWatcher*/ ) { return KillMulti ( dKlist ); };
 	virtual				~IndexSegment_c() = default;
 
@@ -1270,10 +1281,6 @@ public:
 
 	virtual void				GetFieldFilterSettings ( CSphFieldFilterSettings & tSettings ) const;
 
-	// put external files (if any) into index folder
-	// copy the rest of the external files to index folder
-	virtual bool				CopyExternalFiles ( int iPostfix, StrVec_t & dCopied ) { return true; }
-
 	// used for query optimizer calibration
 	virtual HistogramContainer_c * Debug_GetHistograms() const { return nullptr; }
 	virtual SI::Index_i *		Debug_GetSI() const { return nullptr; }
@@ -1454,8 +1461,8 @@ void				SetPseudoSharding ( bool bSet );
 bool				GetPseudoSharding();
 void				SetPseudoShardingThresh ( int iThresh );
 
-void				InitSkipCache ( int64_t iCacheSize );
-void				ShutdownSkipCache();
+struct BuildBufferSettings_t;
+void				SetMergeSettings ( const BuildBufferSettings_t & tSettings );
 
 //////////////////////////////////////////////////////////////////////////
 

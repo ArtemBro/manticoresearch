@@ -293,7 +293,7 @@ public:
 	bool			AddSchemaItem ( SqlNode_t * pNode );
 	bool			SetMatch ( const SqlNode_t & tValue );
 	bool			AddMatch ( const SqlNode_t & tValue, const SqlNode_t & tIndex );
-	bool			SetKNN ( const SqlNode_t & tAttr, const SqlNode_t & tK, const SqlNode_t & tValues );
+	bool			SetKNN ( const SqlNode_t & tAttr, const SqlNode_t & tK, const SqlNode_t & tValues, const SqlNode_t * pEf );
 	void			AddConst ( int iList, const SqlNode_t& tValue );
 	void			SetLocalStatement ( const SqlNode_t & tName );
 	bool			AddFloatRangeFilter ( const SqlNode_t & tAttr, float fMin, float fMax, bool bHasEqual, bool bExclude=false );
@@ -307,6 +307,7 @@ public:
 	CSphFilterSettings * AddFilter ( const SqlNode_t & tCol, ESphFilter eType );
 	CSphFilterSettings * AddFilter ( const SqlNode_t & tCol, ESphFilter eType, const RefcountedVector_c<AttrValue_t> & dValues );
 	bool			AddStringFilter ( const SqlNode_t & tCol, const SqlNode_t & tVal, bool bExclude );
+	bool			AddStringCmpFilter ( const SqlNode_t & tCol, const SqlNode_t & tVal, bool bExclude, EStrCmpDir eStrCmpDir );
 	CSphFilterSettings * AddValuesFilter ( const SqlNode_t & tCol ) { return AddFilter ( tCol, SPH_FILTER_VALUES ); }
 	CSphFilterSettings * AddValuesFilter ( const SqlNode_t & tCol, const RefcountedVector_c<AttrValue_t> & dValues );
 	bool			AddStringListFilter ( const SqlNode_t & tCol, SqlNode_t & tVal, StrList_e eType, bool bInverse=false );
@@ -1235,10 +1236,12 @@ bool SqlParser_c::AddMatch ( const SqlNode_t & tValue, const SqlNode_t & tIndex 
 	return true;
 }
 
-bool SqlParser_c::SetKNN ( const SqlNode_t & tAttr, const SqlNode_t & tK, const SqlNode_t & tValues )
+bool SqlParser_c::SetKNN ( const SqlNode_t & tAttr, const SqlNode_t & tK, const SqlNode_t & tValues, const SqlNode_t * pEf )
 {
 	ToString ( m_pQuery->m_sKNNAttr, tAttr );
 	m_pQuery->m_iKNNK = tK.GetValueInt();
+	if ( pEf )
+		m_pQuery->m_iKnnEf = pEf->GetValueInt();
 	auto pValues = tValues.m_pValues;
 	if ( pValues )
 	{
@@ -1508,6 +1511,19 @@ bool SqlParser_c::AddStringFilter ( const SqlNode_t & tCol, const SqlNode_t & tV
 		return false;
 	CSphString & sFilterString = pFilter->m_dStrings.Add();
 	sFilterString = ToStringUnescape ( tVal );
+	pFilter->m_bExclude = bExclude;
+	return true;
+}
+
+
+bool SqlParser_c::AddStringCmpFilter ( const SqlNode_t & tCol, const SqlNode_t & tVal, bool bExclude, EStrCmpDir eStrCmpDir )
+{
+	CSphFilterSettings * pFilter = AddFilter ( tCol, SPH_FILTER_STRING );
+	if ( !pFilter )
+		return false;
+	CSphString & sFilterString = pFilter->m_dStrings.Add();
+	sFilterString = ToStringUnescape ( tVal );
+	pFilter->m_eStrCmpDir = eStrCmpDir;
 	pFilter->m_bExclude = bExclude;
 	return true;
 }

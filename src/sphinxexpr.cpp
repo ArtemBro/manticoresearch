@@ -3696,7 +3696,7 @@ static inline const char* FuncNameByHash ( int iFunc )
 		, "utc_time", "utc_timestamp", "timediff", "datediff", "date_add", "date_sub", "current_user"
 		, "connection_id", "all", "any", "indexof", "min_top_weight", "min_top_sortval", "atan2", "rand"
 		, "regex", "substring_index", "upper", "lower", "last_insert_id", "levenshtein", "date_format"
-		, "database", "user", "version" };
+		, "database", "user", "version", "range", "histogram", "date_range", "date_histogram" };
 
 	return dNames[iFunc];
 }
@@ -3838,7 +3838,7 @@ public:
 	}
 
 							~ExprParser_t ();
-	ISphExpr *				Parse ( const char * szExpr, const ISphSchema & tSchema, const JoinArgs_t * pJoinArgs, ESphAttr * pAttrType, bool * pUsesWeight, CSphString & sError );
+	ISphExpr *				Parse ( const char * szExpr, const ISphSchema & tSchema, const CSphString * pJoinIdx, ESphAttr * pAttrType, bool * pUsesWeight, CSphString & sError );
 
 protected:
 	int						m_iParsed = 0;	///< filled by yyparse() at the very end
@@ -3892,7 +3892,7 @@ private:
 	void *					m_pScanner = nullptr;
 	Str_t					m_sExpr;
 	const ISphSchema *		m_pSchema = nullptr;
-	const JoinArgs_t *		m_pJoinArgs = nullptr;
+	const CSphString *		m_pJoinIdx = nullptr;
 	CSphVector<ExprNode_t>	m_dNodes;
 	StrVec_t				m_dUservars;
 	CSphVector<char*>		m_dIdents;
@@ -4239,7 +4239,7 @@ int ExprParser_t::ProcessRawToken ( const char * sToken, int iLen, YYSTYPE * lva
 		return iRes;
 
 	// check for table name
-	if ( m_pJoinArgs && ( m_pJoinArgs->m_sIndex1==sTok || m_pJoinArgs->m_sIndex2==sTok ) )
+	if ( m_pJoinIdx && *m_pJoinIdx==sTok )
 	{
 		CSphString sTokMixed { sToken, iLen };
 		m_dIdents.Add ( sTokMixed.Leak() );
@@ -7274,6 +7274,20 @@ public:
 		m_dHashes.Sort();
 	}
 
+	Expr_JsonFieldIn_c ( const VecTraits_T<CSphString> & dVals, ISphExpr * pArg )
+		: Expr_ArgVsConstSet_T<int64_t> ( pArg )
+	{
+		m_dHashes.AddN ( dVals.GetLength() );
+		m_uValueHash = SPH_FNV64_SEED;
+		ARRAY_FOREACH ( i, dVals )
+		{
+			const CSphString & sVal = dVals[i];
+			m_dHashes[i] = sphFNV64 ( sVal.cstr() );
+			m_uValueHash = sphFNV64cont ( sVal.cstr(), m_uValueHash );
+		}
+		m_dHashes.Uniq();
+	}
+
 	void Command ( ESphExprCommand eCmd, void * pArg ) final
 	{
 		Expr_ArgVsConstSet_T<int64_t>::Command ( eCmd, pArg );
@@ -7462,6 +7476,11 @@ private:
 		, m_dHashes ( rhs.m_dHashes )
 	{}
 };
+
+ISphExpr * ExprJsonIn ( const VecTraits_T<CSphString> & dVals, ISphExpr * pArg )
+{
+	return new Expr_JsonFieldIn_c ( dVals, pArg );
+}
 
 // fixme! Expr_ArgVsConstSet_T collects raw packed strings in the case.
 // m.b. store FNV hashes there instead, and use them to boost search speed?
@@ -9210,7 +9229,7 @@ int ExprParser_t::AddNodeFunc ( int iFunc, int iArg )
 			return -1;
 		}
 
-		if ( dRetTypes[0]!=SPH_ATTR_INTEGER && dRetTypes[0]!=SPH_ATTR_BIGINT && dRetTypes[0]!=SPH_ATTR_FLOAT )
+		if ( dRetTypes[0]!=SPH_ATTR_INTEGER && dRetTypes[0]!=SPH_ATTR_BIGINT && dRetTypes[0]!=SPH_ATTR_FLOAT && dRetTypes[0]!=SPH_ATTR_TIMESTAMP )
 		{
 			m_sParserError.SetSprintf ( "%s() arguments 1 must be number", sFuncName );
 			return -1;
@@ -9233,7 +9252,7 @@ int ExprParser_t::AddNodeFunc ( int iFunc, int iArg )
 			return -1;
 		}
 
-		if ( dRetTypes[0]!=SPH_ATTR_INTEGER && dRetTypes[0]!=SPH_ATTR_BIGINT && dRetTypes[0]!=SPH_ATTR_FLOAT )
+		if ( dRetTypes[0]!=SPH_ATTR_INTEGER && dRetTypes[0]!=SPH_ATTR_BIGINT && dRetTypes[0]!=SPH_ATTR_FLOAT && dRetTypes[0]!=SPH_ATTR_TIMESTAMP )
 		{
 			m_sParserError.SetSprintf ( "%s() arguments 1 must be number", sFuncName );
 			return -1;
@@ -9908,7 +9927,7 @@ void SetExprNodeStackItemSize ( int iCreateSize, int iEvalSize )
 }
 
 
-ISphExpr * ExprParser_t::Parse ( const char * sExpr, const ISphSchema & tSchema, const JoinArgs_t * pJoinArgs, ESphAttr * pAttrType, bool * pUsesWeight, CSphString & sError )
+ISphExpr * ExprParser_t::Parse ( const char * sExpr, const ISphSchema & tSchema, const CSphString * pJoinIdx, ESphAttr * pAttrType, bool * pUsesWeight, CSphString & sError )
 {
 	const char* szExpr = sExpr;
 
@@ -9922,7 +9941,7 @@ ISphExpr * ExprParser_t::Parse ( const char * sExpr, const ISphSchema & tSchema,
 	// setup lexer
 	m_sExpr = { szExpr, (int)strlen (szExpr) };
 	m_pSchema = &tSchema;
-	m_pJoinArgs = pJoinArgs;
+	m_pJoinIdx = pJoinIdx;
 
 	// setup constant functions
 	m_iConstNow = (int) time ( nullptr );
@@ -10065,11 +10084,11 @@ JoinArgs_t::JoinArgs_t ( const ISphSchema & tJoinedSchema, const CSphString & sI
 {}
 
 /// parser entry point
-ISphExpr * sphExprParse ( const char * szExpr, const ISphSchema & tSchema, const JoinArgs_t * pJoinArgs, CSphString & sError, ExprParseArgs_t & tArgs )
+ISphExpr * sphExprParse ( const char * szExpr, const ISphSchema & tSchema, const CSphString * pJoinIdx, CSphString & sError, ExprParseArgs_t & tArgs )
 {
 	// parse into opcodes
 	ExprParser_t tParser ( tArgs.m_pHook, tArgs.m_pProfiler, tArgs.m_eCollation );
-	ISphExpr * pRes = tParser.Parse ( szExpr, tSchema, pJoinArgs, tArgs.m_pAttrType, tArgs.m_pUsesWeight, sError );
+	ISphExpr * pRes = tParser.Parse ( szExpr, tSchema, pJoinIdx, tArgs.m_pAttrType, tArgs.m_pUsesWeight, sError );
 	if ( tArgs.m_pZonespanlist )
 		*tArgs.m_pZonespanlist = tParser.m_bHasZonespanlist;
 	if ( tArgs.m_pEvalStage )

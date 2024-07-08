@@ -141,7 +141,8 @@ class ISphMatchSorter;
 
 enum QueryDebug_e
 {
-	QUERY_DEBUG_NO_PAYLOAD = 1<<0
+	QUERY_DEBUG_NO_PAYLOAD = 1<<0,
+	QUERY_DEBUG_NO_LOG = 1<<1
 };
 
 // collect valid schemas from sorters, excluding one
@@ -810,7 +811,6 @@ int				ConsiderStack ( const struct XQNode_t * pRoot, CSphString & sError );
 int				ConsiderStackAbsolute ( const struct XQNode_t* pRoot );
 void			sphTransformExtendedQuery ( XQNode_t ** ppNode, const CSphIndexSettings & tSettings, bool bHasBooleanOptimization, const ISphKeywordsStat * pKeywords );
 void			TransformAotFilter ( XQNode_t * pNode, const CSphWordforms * pWordforms, const CSphIndexSettings& tSettings );
-bool			sphMerge ( const CSphIndex * pDst, const CSphIndex * pSrc, VecTraits_T<CSphFilterSettings> dFilters, CSphIndexProgress & tProgress, CSphString& sError );
 int				ExpandKeywords ( int iIndexOpt, QueryOption_e eQueryOpt, const CSphIndexSettings & tSettings, bool bWordDict );
 bool			ParseMorphFields ( const CSphString & sMorphology, const CSphString & sMorphFields, const CSphVector<CSphColumnInfo> & dFields, CSphBitvec & tMorphFields, CSphString & sError );
 
@@ -828,6 +828,18 @@ bool			AddFieldLens ( CSphSchema & tSchema, bool bDynamic, CSphString & sError )
 bool			LoadHitlessWords ( const CSphString & sHitlessFiles, const TokenizerRefPtr_c& pTok, const DictRefPtr_c& pDict, CSphVector<SphWordID_t> & dHitlessWords, CSphString & sError );
 void			GetSettingsFiles ( const TokenizerRefPtr_c& pTok, const DictRefPtr_c& pDict, const CSphIndexSettings& tSettings, const FilenameBuilder_i* pFilenameBuilder, StrVec_t& dFiles );
 
+struct BuildBufferSettings_t
+{
+	int m_iSIMemLimit		= 128*1024*1024;
+	int m_iBufferAttributes = 8*1024*1024;
+	int m_iBufferStorage	= 8*1024*1024;
+	int m_iBufferColumnar	= 1*1024*1024;
+	int m_iBufferFulltext	= 8*1024*1024;
+	int m_iBufferDict		= 16*1024*1024;
+};
+
+bool			sphMerge ( const CSphIndex * pDst, const CSphIndex * pSrc, VecTraits_T<CSphFilterSettings> dFilters, CSphIndexProgress & tProgress, CSphString& sError );
+
 /// json save/load
 void operator<< ( JsonEscapedBuilder& tOut, const CSphSchema& tSchema );
 
@@ -837,8 +849,6 @@ void			RebalanceWeights ( const CSphFixedVector<int64_t> & dTimers, CSphFixedVec
 const char * CheckFmtMagic ( DWORD uHeader );
 bool WriteKillList ( const CSphString & sFilename, const DocID_t * pKlist, int nEntries, const KillListTargets_c & tTargets, CSphString & sError );
 void WarnAboutKillList ( const CSphVector<DocID_t> & dKillList, const KillListTargets_c & tTargets );
-extern const char * g_sTagInfixBlocks;
-extern const char * g_sTagInfixEntries;
 
 template < typename VECTOR >
 int sphPutBytes ( VECTOR * pOut, const void * pData, int iLen )
@@ -897,13 +907,13 @@ int sphDictCmpStrictly ( const char* pStr1, int iLen1, const char* pStr2, int iL
 template <typename CP>
 int sphCheckpointCmp ( const char * sWord, int iLen, const CP & tCP )
 {
-	return sphDictCmp ( sWord, iLen, tCP.m_sWord, (int) strlen ( tCP.m_sWord ) );
+	return sphDictCmp ( sWord, iLen, tCP.m_szWord, (int) strlen ( tCP.m_szWord ) );
 }
 
 template <typename CP>
 int sphCheckpointCmpStrictly ( const char * sWord, int iLen, const CP & tCP )
 {
-	return sphDictCmpStrictly ( sWord, iLen, tCP.m_sWord, (int)strlen ( tCP.m_sWord ) );
+	return sphDictCmpStrictly ( sWord, iLen, tCP.m_szWord, (int)strlen ( tCP.m_szWord ) );
 }
 
 template<typename CP>
@@ -1160,7 +1170,9 @@ struct ExpansionContext_t : public ExpansionTrait_t
 	int m_iMinInfixLen					= 0;
 	bool m_bMergeSingles				= false;
 	CSphScopedPayload * m_pPayloads		= nullptr;
-	int m_iCutoff = -1;
+	int m_iCutoff						= -1;
+	bool m_bAllowExpansion				= true;
+
 	ExpansionStats_t m_tExpansionStats;
 
 	bool								m_bOnlyTreeFix = false;
@@ -1179,6 +1191,7 @@ struct GetKeywordsSettings_t
 	bool	m_bSortByDocs = false;
 	bool	m_bSortByHits = false;
 	int		m_iCutoff = -1;
+	bool	m_bAllowExpansion = true;
 };
 
 XQNode_t * sphExpandXQNode ( XQNode_t * pNode, ExpansionContext_t & tCtx );
@@ -1266,47 +1279,30 @@ void localtime_r ( const time_t * clock, struct tm * res );
 void gmtime_r ( const time_t * clock, struct tm * res );
 #endif
 
-struct InfixBlock_t
-{
-	union
-	{
-		const char *	m_sInfix;
-		DWORD			m_iInfixOffset;
-	};
-	DWORD				m_iOffset;
-};
-
-
-/// infix hash builder
-class ISphInfixBuilder
-{
-public:
-	explicit		ISphInfixBuilder() {}
-	virtual			~ISphInfixBuilder() {}
-	virtual void	AddWord ( const BYTE * pWord, int iWordLength, int iCheckpoint, bool bHasMorphology ) = 0;
-	virtual void	SaveEntries ( CSphWriter & wrDict ) = 0;
-	virtual int64_t	SaveEntryBlocks ( CSphWriter & wrDict ) = 0;
-	virtual int		GetBlocksWordsSize () const = 0;
-};
-
-
-std::unique_ptr<ISphInfixBuilder> sphCreateInfixBuilder ( int iCodepointBytes, CSphString * pError );
-bool sphLookupInfixCheckpoints ( const char * sInfix, int iBytes, const BYTE * pInfixes, const CSphVector<InfixBlock_t> & dInfixBlocks, int iInfixCodepointBytes, CSphVector<DWORD> & dCheckpoints );
-// calculate length, upto iInfixCodepointBytes chars from infix start
-int sphGetInfixLength ( const char * sInfix, int iBytes, int iInfixCodepointBytes );
-
-
 /// compute utf-8 character length in bytes from its first byte
 inline int sphUtf8CharBytes ( BYTE uFirst )
 {
-	switch ( uFirst>>4 )
-	{
-		case 12: return 2; // 110x xxxx, 2 bytes
-		case 13: return 2; // 110x xxxx, 2 bytes
-		case 14: return 3; // 1110 xxxx, 3 bytes
-		case 15: return 4; // 1111 0xxx, 4 bytes
-		default: return 1; // either 1 byte, or invalid/unsupported code
-	}
+	// 110x xxxx, 2 bytes
+	// 1110 xxxx, 3 bytes
+	// 1111 0xxx, 4 bytes
+	// others - either 1 byte, or invalid/unsupported code
+
+	static const std::array<BYTE, 16> dValues { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 4 };
+	return dValues[uFirst >> 4];
+}
+
+// calculate length, upto iInfixCodepointBytes chars from infix start
+inline int sphGetInfixLength ( const char* sInfix, int iBytes, int iInfixCodepointBytes )
+{
+	if ( iInfixCodepointBytes == 1 )
+		return Min ( 6, iBytes );
+
+	int iCharsLeft = 6;
+	const char* s = sInfix;
+	const char* sMax = sInfix + iBytes;
+	while ( iCharsLeft-- && s < sMax )
+		s += sphUtf8CharBytes ( *s );
+	return (int)( s - sInfix );
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -1324,7 +1320,7 @@ struct RemapXSV_t
 void sphGetAttrsToSend ( const ISphSchema & tSchema, bool bAgentMode, bool bNeedId, CSphBitvec & tAttrs );
 
 
-inline void FlipEndianess ( DWORD* pData )
+inline void FlipEndianness ( DWORD* pData )
 {
 	BYTE* pB = (BYTE*)pData;
 	BYTE a = pB[0];
@@ -1356,7 +1352,7 @@ BYTE PrereadMapping ( const char * sIndexName, const char * sFor, bool bMlock, b
 
 	auto pCur = (const BYTE*)tBuf.GetReadPtr();
 	const BYTE * pEnd = pCur + tBuf.GetLengthBytes();
-	const int iHalfPage = 2048;
+	const int iHalfPage = GetMemPageSize()/2;
 
 	g_uHash = 0xff;
 	for ( ; pCur<pEnd; pCur+=iHalfPage )

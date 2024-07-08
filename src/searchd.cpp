@@ -61,6 +61,7 @@
 #include "joinsorter.h"
 #include "schematransform.h"
 #include "frontendschema.h"
+#include "skip_cache.h"
 
 // services
 #include "taskping.h"
@@ -663,6 +664,9 @@ public:
 				if ( m_dLog[i].m_sError==m_dLog[i-1].m_sError )
 					continue;
 
+			if ( m_dLog[iSpanStart].m_sError.IsEmpty() )
+				continue;
+
 			sReport << sColon;
 
 			ReportIndexesName ( iSpanStart, i, m_dLog, sReport );
@@ -1052,7 +1056,7 @@ LONG WINAPI CrashLogger::HandleCrash ( EXCEPTION_POINTERS * pExc )
 #if !_WIN32
 	if ( bValidQuery )
 	{
-		size_t iPageSize = getpagesize();
+		size_t iPageSize = GetMemPageSize();
 
 		// FIXME! That is too complex way, remove all of this and just move query dump to the bottom
 		// remove also mincore_test.cmake, it's invokation from CMakeLists.txt and HAVE_UNSIGNED_MINCORE
@@ -1816,6 +1820,7 @@ void SearchRequestBuilder_c::SendQuery ( const char * sIndexes, ISphOutputBuffer
 			case SPH_FILTER_USERVAR:
 			case SPH_FILTER_STRING:
 				tOut.SendString ( tFilter.m_dStrings.GetLength()==1 ? tFilter.m_dStrings[0].cstr() : nullptr );
+				tOut.SendByte ( (BYTE)tFilter.m_eStrCmpDir );
 				break;
 
 			case SPH_FILTER_NULL:
@@ -2417,7 +2422,7 @@ static void FixupQuerySettings ( CSphQuery & tQuery )
 }
 
 
-static bool ParseSearchFilter ( CSphFilterSettings & tFilter, InputBuffer_c & tReq, ISphOutputBuffer & tOut, int iMasterVer )
+static bool ParseSearchFilter ( CSphFilterSettings & tFilter, InputBuffer_c & tReq, ISphOutputBuffer & tOut, int iMasterVer, DWORD uVer )
 {
 	tFilter.m_sAttrName = tReq.GetString ();
 	sphColumnToLowercase ( const_cast<char *>( tFilter.m_sAttrName.cstr() ) );
@@ -2450,6 +2455,8 @@ static bool ParseSearchFilter ( CSphFilterSettings & tFilter, InputBuffer_c & tR
 	case SPH_FILTER_USERVAR:
 	case SPH_FILTER_STRING:
 		tFilter.m_dStrings.Add ( tReq.GetString() );
+		if ( uVer>=0x126 )
+			tFilter.m_eStrCmpDir = (EStrCmpDir) tReq.GetByte();
 		break;
 
 	case SPH_FILTER_NULL:
@@ -2598,7 +2605,7 @@ bool ParseSearchQuery ( InputBuffer_c & tReq, ISphOutputBuffer & tOut, CSphQuery
 
 	tQuery.m_dFilters.Resize ( iAttrFilters );
 	for ( auto & i : tQuery.m_dFilters )
-		if ( !ParseSearchFilter ( i, tReq, tOut, uMasterVer ) )
+		if ( !ParseSearchFilter ( i, tReq, tOut, uMasterVer, uVer ) )
 			return false;
 
 	// now add id range filter
@@ -2843,14 +2850,6 @@ bool ParseSearchQuery ( InputBuffer_c & tReq, ISphOutputBuffer & tOut, CSphQuery
 }
 
 //////////////////////////////////////////////////////////////////////////
-
-struct EscapeQuotator_t
-{
-	static constexpr BYTE EscapingSpace ( BYTE c )
-	{
-		return ( c == '\\' || c == '\'' ) ? 1 : 0;
-	}
-};
 
 using QuotationEscapedBuilder = EscapedStringBuilder_T<BaseQuotation_T<EscapeQuotator_t>>;
 
@@ -3360,6 +3359,10 @@ static void LogQuery ( const CSphQuery & q, const CSphQueryResultMeta & tMeta, c
 {
 	if ( g_iQueryLogMinMs>0 && tMeta.m_iQueryTime<g_iQueryLogMinMs )
 		return;
+	// should not log query from buddy in the info but only in debug and more verbose
+	bool bNoLogQuery = ( ( q.m_uDebugFlags & QUERY_DEBUG_NO_LOG )==QUERY_DEBUG_NO_LOG );
+	if ( bNoLogQuery && g_eLogLevel==SPH_LOG_INFO )
+		return;
 
 	switch ( g_eLogFormat )
 	{
@@ -3418,6 +3421,8 @@ void ReportIndexesName ( int iSpanStart, int iSpandEnd, const CSphVector<SearchF
 static void LogStatementSphinxql ( Str_t sQuery, int iRealTime )
 {
 	if ( g_iQueryLogFile<0 || g_eLogFormat!=LOG_FORMAT_SPHINXQL || !IsFilled ( sQuery ) )
+		return;
+	if ( session::IsQueryLogDisabled() && g_eLogLevel==SPH_LOG_INFO )
 		return;
 
 	StringBuilder_c tBuf;
@@ -5502,7 +5507,7 @@ int SearchHandler_c::CreateMultiQueryOrFacetSorters ( const CSphIndex * pIndex, 
 		return 0;
 	}
 
-	if ( m_bFacetQueue && !CreateJoinMultiSorter ( pIndex, dJoinedIndexes[0], tQueueSettings, m_dNQueries.First(), dSorters, tQueueRes.m_bJoinedGroupSort, dErrors[0] ) )
+	if ( m_bFacetQueue && !CreateJoinMultiSorter ( pIndex, dJoinedIndexes[0], tQueueSettings, m_dNQueries, dSorters, dErrors[0] ) )
 	{
 		dSorters.Apply ( [] ( ISphMatchSorter *& pSorter ) { SafeDelete (pSorter); } );
 		return 0;
@@ -6093,7 +6098,7 @@ void SearchHandler_c::RunLocalSearches ()
 		auto tJobContext = dCtx.CloneNewContext();
 		auto& tCtx = tJobContext.first;
 		LOCSEARCHINFO << "RunLocalSearches cloned context " << tJobContext.second;
-		Threads::Coro::SetThrottlingPeriod ( session::GetThrottlingPeriodMS() );
+		Threads::Coro::SetThrottlingPeriodMS ( session::GetThrottlingPeriodMS() );
 		while ( true )
 		{
 			if ( !pSource->FetchTask ( iJob ) )
@@ -6980,7 +6985,8 @@ static void CheckExpansion ( CSphQueryResultMeta & tMeta )
 	int iMerged = (int)( float(tMeta.m_tExpansionStats.m_iMerged) * 100.0f / iTotal );
 
 	StringBuilder_c sBuf;
-	sBuf.Appendf ( "Your query performance may be improved by adjusting the 'expansion_merge_threshold_docs/hits' settings. The current merge of expanded terms is %d%%, with a total of %d. Consider reviewing these settings in your 'searchd' configuration for better performance.", iMerged, iTotal );
+	// notice, msg should not be finished with dot, and start with capital. That is because several messages can be unified with '; ' delimiter.
+	sBuf.Appendf ( "current merge of expanded terms is %d%%, with a total of %d. Read manual about 'expansion_merge_threshold_docs/hits'", iMerged, iTotal );
 	if ( !tMeta.m_sWarning.IsEmpty() )
 		sBuf.Appendf ( "; %s", tMeta.m_sWarning.cstr() );
 
@@ -7778,8 +7784,8 @@ public:
 
 		case SPH_ATTR_TIMESTAMP:
 		{
-			if ( pName && tVal.m_iType==SqlInsert_t::QUOTED_STRING && StrEq ( pName->cstr(), "@timestamp" ) )
-				tAttr = GetUTC ( tVal.m_sVal, CompatDateFormat() );
+			if ( pName && tVal.m_iType==SqlInsert_t::QUOTED_STRING )
+				tAttr = GetUTC ( tVal.m_sVal );
 			else
 				tAttr = ToInt(tVal);
 		}
@@ -8101,7 +8107,7 @@ static void MakeSnippetsCoro ( const VecTraits_T<int>& dTasks, CSphVector<Excerp
 		auto tJobContext = dCtx.CloneNewContext();
 		auto& tCtx = tJobContext.first;
 		sphLogDebug ( "MakeSnippetsCoro cloned context %d", tJobContext.second );
-		Threads::Coro::SetThrottlingPeriod ( session::GetThrottlingPeriodMS() );
+		Threads::Coro::SetThrottlingPeriodMS ( session::GetThrottlingPeriodMS() );
 		while (true)
 		{
 			myinfo::SetTaskInfo ( "s %d:", iJob );
@@ -9437,7 +9443,7 @@ void StmtErrorReporter_i::Error ( const char * sTemplate, ... )
 	sBuf.vAppendf ( sTemplate, ap );
 	va_end ( ap );
 
-	ErrorEx ( MYSQL_ERR_PARSE_ERROR, sBuf.cstr () );
+	ErrorEx ( EMYSQL_ERR::PARSE_ERROR, sBuf.cstr () );
 }
 
 class StmtErrorReporter_c final : public StmtErrorReporter_i
@@ -9457,7 +9463,7 @@ public:
 		m_tRowBuffer.Ok ( iAffectedRows, nWarnings );
 	}
 
-	void ErrorEx ( MysqlErrors_e iErr, const char * sError ) final
+	void ErrorEx ( EMYSQL_ERR iErr, const char * sError ) final
 	{
 		m_tRowBuffer.Error ( sError, iErr );
 	}
@@ -9688,33 +9694,6 @@ static bool ParseBsonDocument ( const VecTraits_T<BYTE> & dDoc, const SchemaItem
 		}
 	}
 	return true;
-}
-
-
-static void FixParsedMva ( const CSphVector<int64_t> & dParsed, CSphVector<int64_t> & dMva, int iCount )
-{
-	if ( !iCount )
-		return;
-
-	// dParsed:
-	// 0 - iCount elements: offset to MVA values with leading MVA element count
-	// Could be not in right order
-
-	dMva.Resize ( 0 );
-	for ( int i=0; i<iCount; ++i )
-	{
-		int iOff = dParsed[i];
-		if ( !iOff )
-		{
-			dMva.Add ( 0 );
-			continue;
-		}
-
-		DWORD uMvaCount = dParsed[iOff];
-		int64_t * pMva = dMva.AddN ( uMvaCount + 1 );
-		*pMva++ = uMvaCount;
-		memcpy ( pMva, dParsed.Begin() + iOff + 1, sizeof(dMva[0]) * uMvaCount );
-	}
 }
 
 
@@ -10067,7 +10046,7 @@ static void PQLocalMatch ( const BlobVec_t & dDocs, const CSphString & sIndex, c
 	const CSphSchema & tSchema = pIndex->GetInternalSchema();
 	int iFieldsCount = tSchema.GetFieldsCount();
 
-	InsertDocData_t tDoc(tSchema);
+	InsertDocData_c tDoc(tSchema);
 
 	// set defaults
 	int iAttrsCount = tSchema.GetAttrsCount ();
@@ -10185,7 +10164,7 @@ static void PQLocalMatch ( const BlobVec_t & dDocs, const CSphString & sIndex, c
 			}
 		}
 
-		FixParsedMva ( dMvaParsed, tDoc.m_dMvas, iMvaCounter );
+		tDoc.FixParsedMVAs ( dMvaParsed, iMvaCounter );
 
 		if ( !sMsg.ErrEmpty () )
 			break;
@@ -10650,7 +10629,7 @@ static bool CreateAttrMaps ( CSphVector<int> & dAttrSchema, CSphVector<int> & dF
 		{
 			CSphString sError;
 			sError.SetSprintf ( "column '%s' specified twice", dCheck[i].cstr() );
-			tOut.ErrorEx ( MYSQL_ERR_FIELD_SPECIFIED_TWICE, sError.cstr() );
+			tOut.ErrorEx ( EMYSQL_ERR::FIELD_SPECIFIED_TWICE, sError.cstr() );
 			return false;
 		}
 
@@ -10690,7 +10669,7 @@ static bool CreateAttrMaps ( CSphVector<int> & dAttrSchema, CSphVector<int> & dF
 
 /////////////////////////////////////////////////////////////////////
 
-class AttributeConverter_c : public InsertDocData_t
+class AttributeConverter_c : public InsertDocData_c
 {
 public:
 				AttributeConverter_c ( const CSphSchema & tSchema, const CSphVector<bool> & dFieldAttrs, CSphString & sError, CSphString & sWarning );
@@ -10727,7 +10706,7 @@ private:
 
 
 AttributeConverter_c::AttributeConverter_c ( const CSphSchema & tSchema, const CSphVector<bool> & dFieldAttrs, CSphString & sError, CSphString & sWarning )
-	: InsertDocData_t ( tSchema )
+	: InsertDocData_c ( tSchema )
 	, m_tSchema ( tSchema )
 	, m_pDocId ( tSchema.GetAttr ( sphGetDocidName() ) )
 	, m_dFieldAttrs ( dFieldAttrs )
@@ -10826,16 +10805,16 @@ bool AttributeConverter_c::CheckMVA ( const CSphColumnInfo & tCol, const SqlInse
 
 	if ( !tVal.m_pVals )
 	{
-		m_dMvas.Add(0);
+		AddMVALength(0);
 		return true;
 	}
 
 	auto & tAddVals = *tVal.m_pVals;
 	if ( tCol.m_eAttrType==SPH_ATTR_FLOAT_VECTOR )
 	{
-		m_dMvas.Add ( tAddVals.GetLength() );
+		AddMVALength ( tAddVals.GetLength() );
 		for ( const auto & i : tAddVals )
-			m_dMvas.Add ( sphF2DW ( i.m_fValue ) );
+			AddMVAValue ( sphF2DW ( i.m_fValue ) );
 
 		return true;
 	}
@@ -10850,9 +10829,9 @@ bool AttributeConverter_c::CheckMVA ( const CSphColumnInfo & tCol, const SqlInse
 		m_sWarning.SetSprintf ( "MVA attribute %d at row %d: inserting float value", iCol, iRow );
 
 	tAddVals.Uniq();
-	m_dMvas.Add ( tAddVals.GetLength() );
+	AddMVALength ( tAddVals.GetLength() );
 	for ( const auto & i : tAddVals )
-		m_dMvas.Add ( i.m_iValue );
+		AddMVAValue ( i.m_iValue );
 
 	return true;
 }
@@ -10893,8 +10872,9 @@ void AttributeConverter_c::SetDefaultAttrValue ( int iCol )
 
 	if ( tCol.m_eAttrType==SPH_ATTR_STRING || tCol.m_eAttrType==SPH_ATTR_STRINGPTR || tCol.m_eAttrType==SPH_ATTR_JSON )
 		m_dStrings.Add(nullptr);
+
 	if ( tCol.m_eAttrType==SPH_ATTR_UINT32SET || tCol.m_eAttrType==SPH_ATTR_INT64SET || tCol.m_eAttrType==SPH_ATTR_FLOAT_VECTOR )
-		m_dMvas.Add(0);
+		AddMVALength ( 0, true );
 
 	SqlInsert_t tDefaultVal;
 	tDefaultVal.m_iType = SqlInsert_t::CONST_INT;
@@ -10972,7 +10952,7 @@ void AttributeConverter_c::NewRow()
 {
 	m_dStrings.Resize(0);
 	m_tStrings.Reset();
-	m_dMvas.Resize(0);
+	ResetMVAs();
 }
 
 
@@ -11175,7 +11155,7 @@ static bool AddDocument ( const SqlStmt_t & tStmt, cServedIndexRefPtr_c & pServe
 
 	if ( !sError.IsEmpty() )
 	{
-		tOut.ErrorEx ( MYSQL_ERR_PARSE_ERROR, sError.cstr() );
+		tOut.ErrorEx ( EMYSQL_ERR::PARSE_ERROR, sError.cstr() );
 		return false;
 	}
 
@@ -11188,7 +11168,7 @@ static bool AddDocument ( const SqlStmt_t & tStmt, cServedIndexRefPtr_c & pServe
 	RtAccum_t * pAccum = tAcc.GetAcc ( pIndex, sError );
 	if ( !sError.IsEmpty() )
 	{
-		tOut.ErrorEx ( MYSQL_ERR_PARSE_ERROR, sError.cstr() );
+		tOut.ErrorEx ( EMYSQL_ERR::PARSE_ERROR, sError.cstr() );
 		return false;
 	}
 
@@ -11264,7 +11244,7 @@ static bool AddDocument ( const SqlStmt_t & tStmt, cServedIndexRefPtr_c & pServe
 	if ( !sError.IsEmpty() )
 	{
 		pIndex->RollBack ( pAccum ); // clean up collected data
-		tOut.ErrorEx ( MYSQL_ERR_PARSE_ERROR, sError.cstr() );
+		tOut.ErrorEx ( EMYSQL_ERR::PARSE_ERROR, sError.cstr() );
 		return false;
 	}
 
@@ -11480,6 +11460,7 @@ public:
 	CSphVector<CSphKeywordInfo> & m_dKeywords;
 };
 
+static void LimitKeywords ( int iLimit, CSphVector<CSphKeywordInfo> & dKeywords );
 static void SortKeywords ( const GetKeywordsSettings_t & tSettings, CSphVector<CSphKeywordInfo> & dKeywords );
 bool DoGetKeywords ( const CSphString & sIndex, const CSphString & sQuery, const GetKeywordsSettings_t & tSettings, CSphVector <CSphKeywordInfo> & dKeywords, CSphString & sError, SearchFailuresLog_c & tFailureLog )
 {
@@ -11545,6 +11526,8 @@ bool DoGetKeywords ( const CSphString & sIndex, const CSphString & sQuery, const
 	}
 
 	SortKeywords ( tSettings, dKeywords );
+	if ( tSettings.m_iExpansionLimit )
+		LimitKeywords ( tSettings.m_iExpansionLimit, dKeywords );
 
 	return bOk;
 }
@@ -11739,6 +11722,36 @@ void SortKeywords ( const GetKeywordsSettings_t & tSettings, CSphVector<CSphKeyw
 		dKeywords.Sort ( KeywordSorter_fn() );
 	else
 		dKeywords.Sort ( KeywordSorterDocs_fn() );
+}
+
+struct KeywordLimiter_fn
+{
+	const int m_iLimit = 0;
+	int m_iCount = 0;
+
+	KeywordLimiter_fn ( int iLimit )
+		: m_iLimit ( iLimit )
+	{}
+
+	bool IsEq ( const CSphKeywordInfo & tKw1, const CSphKeywordInfo & tKw2 )
+	{
+		if ( tKw1.m_iQpos!=tKw2.m_iQpos )
+		{
+			m_iCount = 0;
+			return false;
+		}
+
+		m_iCount++;
+		return ( m_iCount>=m_iLimit );
+	}
+};
+
+void LimitKeywords ( int iLimit, CSphVector<CSphKeywordInfo> & dKeywords )
+{
+	assert ( iLimit>0 );
+	KeywordLimiter_fn tLimit ( iLimit );
+	int iLen = sphUniq ( dKeywords.Begin(), dKeywords.GetLength(), tLimit );
+	dKeywords.Resize ( iLen );
 }
 
 // sort by distance asc, document count desc, ABC asc
@@ -13136,7 +13149,7 @@ bool HandleMysqlSelect ( RowBuffer_i & dRows, SearchHandler_c & tHandler )
 	if ( sphInterrupted() )
 	{
 		sphLogDebug ( "HandleClientMySQL: got SIGTERM, sending the packet MYSQL_ERR_SERVER_SHUTDOWN" );
-		dRows.Error ( "Server shutdown in progress", MYSQL_ERR_SERVER_SHUTDOWN );
+		dRows.Error ( "Server shutdown in progress", EMYSQL_ERR::SERVER_SHUTDOWN );
 		return false;
 	}
 
@@ -13274,7 +13287,7 @@ CSphString BuildMetaOneline ( const CSphQueryResultMeta & tMeta )
 	StringBuilder_c sMeta;
 	// since we have us precision, printing 0 will output '0us', which is not necessary true.
 	if ( tMeta.m_iQueryTime > 0 )
-		sMeta.Sprintf ( "--- %d out of %s%l results in %.3t ---", tMeta.m_iMatches, ( tMeta.m_bTotalMatchesApprox ? ">=" : "" ), tMeta.m_iTotalMatches, tMeta.m_iQueryTime * 1000 );
+		sMeta.Sprintf ( "--- %d out of %s%l results in %.3t ---", tMeta.m_iMatches, ( tMeta.m_bTotalMatchesApprox ? ">=" : "" ), tMeta.m_iTotalMatches, (int64_t)tMeta.m_iQueryTime * 1000 );
 	else
 		sMeta.Sprintf ( "--- %d out of %s%l results in 0ms ---", tMeta.m_iMatches, ( tMeta.m_bTotalMatchesApprox ? ">=" : "" ), tMeta.m_iTotalMatches );
 	return (CSphString)sMeta;
@@ -13435,8 +13448,20 @@ void SendMysqlSelectResult ( RowBuffer_i & dRows, const AggrResult_t & tRes, boo
 
 	if ( !tRes.m_iSuccesses )
 	{
-		// at this point, SELECT error logging should have been handled, so pass a NULL stmt to logger
-		dRows.Error ( tRes.m_sError.cstr() );
+		if ( !tRes.m_sError.IsEmpty() )
+		{
+			// at this point, SELECT error logging should have been handled, so pass a NULL stmt to logger
+			dRows.Error ( tRes.m_sError.cstr() );
+			return;
+		}
+		assert ( tRes.m_sError.IsEmpty() );
+		auto iWarns = tRes.m_sWarning.IsEmpty() ? 0 : 1;
+		CSphString sMeta = BuildMetaOneline ( tRes );
+
+		dRows.HeadBegin();
+		dRows.HeadColumn ( "" );
+		dRows.HeadEnd();
+		dRows.Eof ( bMoreResultsFollow, iWarns, sMeta.cstr() );
 		return;
 	}
 
@@ -13961,7 +13986,7 @@ void HandleMysqlMultiStmt ( const CSphVector<SqlStmt_t> & dStmt, CSphQueryResult
 		if ( sphInterrupted() )
 		{
 			sphLogDebug ( "HandleMultiStmt: got SIGTERM, sending the packet MYSQL_ERR_SERVER_SHUTDOWN" );
-			dRows.Error ( "Server shutdown in progress", MYSQL_ERR_SERVER_SHUTDOWN );
+			dRows.Error ( "Server shutdown in progress", EMYSQL_ERR::SERVER_SHUTDOWN );
 			return;
 		}
 	}
@@ -14714,6 +14739,29 @@ void HandleMysqlCompress ( RowBuffer_i & tOut, const DebugCmd::DebugCommand_t & 
 	tOut.Ok();
 }
 
+void HandleMysqlDedup ( RowBuffer_i& tOut, const DebugCmd::DebugCommand_t& tCmd )
+{
+	if ( !sphCheckWeCanModify ( tOut ) )
+		return;
+
+	auto sIndex = tCmd.m_sParam;
+	auto pIndex = GetServed ( sIndex );
+	if ( !ServedDesc_t::IsMutable ( pIndex ) )
+	{
+		tOut.Error ( "DEDUP requires an existing RT table" );
+		return;
+	}
+
+	OptimizeTask_t tTask;
+	tTask.m_eVerb = OptimizeTask_t::eDedup;
+	tTask.m_iFrom = (int)tCmd.m_iPar1;
+	tTask.m_bByOrder = !tCmd.bOpt ( "byid", session::GetOptimizeById() );
+	tTask.m_sIndex = std::move ( sIndex );
+
+	RIdx_T<RtIndex_i*> ( pIndex )->Optimize ( std::move ( tTask ) );
+	tOut.Ok();
+}
+
 // command 'split <IDX> [chunk] N on @uservar [option...]'
 // IDX is tCmd.m_sParam
 // chunk is tCmd.m_iPar1
@@ -15128,6 +15176,7 @@ void HandleMysqlDebug ( RowBuffer_i &tOut, const DebugCmd::DebugCommand_t* pComm
 	case Cmd_e::FILES: HandleMysqlfiles ( tOut, tCmd ); return;
 	case Cmd_e::CLOSE: HandleMysqlclose ( tOut ); return;
 	case Cmd_e::COMPRESS: HandleMysqlCompress ( tOut, tCmd ); return;
+	case Cmd_e::DEDUP: HandleMysqlDedup ( tOut, tCmd ); return;
 	case Cmd_e::SPLIT: HandleMysqlSplit ( tOut, tCmd ); return;
 	case Cmd_e::META: HandleMysqlDebugMeta ( tOut, tCmd, tProfile ); return;
 #if !_WIN32
@@ -15704,12 +15753,14 @@ static void AddDiskIndexStatus ( VectorLike & dStatus, const CSphIndex * pIndex,
 		dStatus.MatchTupletf ( "mem_limit", "%l", tStatus.m_iMemLimit );
 		dStatus.MatchTupletf ( "mem_limit_rate", "%0.2F%%", PercentOf ( tStatus.m_fSaveRateLimit, 1.0, 2 ) );
 		dStatus.MatchTupletf ( "ram_bytes_retired", "%l", tStatus.m_iRamRetired );
+		dStatus.MatchTupletf ( "locked", "%d", tStatus.m_iLockCount );
 	}
 	if ( bPq )
 	{
 		dStatus.MatchTupletf ( "max_stack_need", "%l", tStatus.m_iStackNeed );
 		dStatus.MatchTupletf ( "average_stack_base", "%l", tStatus.m_iStackBase );
 		dStatus.MatchTupletf ( "desired_thread_stack", "%l", sphRoundUp ( tStatus.m_iStackNeed + tStatus.m_iStackBase, 128 ) );
+		dStatus.MatchTupletf ( "locked", "%d", tStatus.m_iLockCount );
 	}
 
 	if ( bRt || bPq )
@@ -15902,7 +15953,7 @@ void HandleSelectIndexStatus ( RowBuffer_i & tOut, const SqlStmt_t * pStmt )
 
 	if ( !ServedDesc_t::IsLocal ( pServed ) )
 	{
-		tOut.Error ( "select TABLE.status requires an existing table" );
+		tOut.Error ( "select TABLE.@status requires an existing table" );
 		return;
 	}
 
@@ -16461,6 +16512,23 @@ static void HandleMysqlAlterIndexSettings ( RowBuffer_i & tOut, const SqlStmt_t 
 	StrVec_t dOldFiles;
 	pRtIndex->GetIndexFiles ( dOldFiles, dOldFiles );
 
+	StrVec_t dCopiedFiles;
+	auto tCleanup = AtScopeExit ( [&dCopiedFiles] { dCopiedFiles.for_each ( [] ( const auto& i ) { unlink ( i.cstr() ); } ); } );
+
+	StrVec_t dNewFiles = tContainer.GetFiles();
+	if ( !tContainer.GetError().IsEmpty() )
+	{
+		tOut.Error ( tContainer.GetError().cstr () );
+		return;
+	}
+
+	CSphString sIndexPath = GetPathOnly ( pRtIndex->GetFilebase() );
+	if ( !CopyExternalIndexFiles ( dNewFiles, sIndexPath, dCopiedFiles, sError ) )
+	{
+		tOut.Error ( sError.cstr () );
+		return;
+	}
+
 	StrVec_t dWarnings;
 	CSphReconfigureSettings tSettings;
 	if ( !PrepareReconfigure ( tStmt.m_sIndex.cstr(), tContainer.AsCfg(), tSettings, &dWarnings, sError ) )
@@ -16487,6 +16555,7 @@ static void HandleMysqlAlterIndexSettings ( RowBuffer_i & tOut, const SqlStmt_t 
 	{
 		// all ok, delete old files
 		RemoveOutdatedFiles ( pRtIndex, dOldFiles );
+		dCopiedFiles.Reset();
 
 		tOut.Ok ( 0, dWarnings.GetLength() );
 	}
@@ -16723,12 +16792,12 @@ void HandleMysqlImportTable ( RowBuffer_i & tOut, const SqlStmt_t & tStmt, CSphS
 }
 
 //////////////////////////////////////////////////////////////////////////
-void HandleMysqlFreezeIndexes ( RowBuffer_i& tOut, const CSphString& sIndexes, CSphString& sWarningOut )
+void HandleMysqlFreezeIndexes ( RowBuffer_i& tOut, const SqlStmt_t& tStmt, CSphString& sWarningOut )
 {
 	// search through specified local indexes
 	StrVec_t dIndexes, dNonlockedIndexes, dIndexFiles;
 
-	ParseIndexList ( sIndexes, dIndexes );
+	ParseIndexList ( tStmt.m_sIndex, dIndexes );
 	for ( const auto& sIndex : dIndexes )
 	{
 		auto pIndex = GetServed ( sIndex );
@@ -16754,6 +16823,8 @@ void HandleMysqlFreezeIndexes ( RowBuffer_i& tOut, const CSphString& sIndexes, C
 		++iWarnings;
 	}
 
+	CheckLike tSelector { tStmt.m_sStringParam.cstr() };
+
 	tOut.HeadBegin ();
 	tOut.HeadColumn ( "file" );
 	tOut.HeadColumn ( "normalized" );
@@ -16761,6 +16832,9 @@ void HandleMysqlFreezeIndexes ( RowBuffer_i& tOut, const CSphString& sIndexes, C
 
 	for ( const auto& sFile : dIndexFiles )
 	{
+		if ( !tSelector.Match ( sFile.cstr() ) )
+			continue;
+
 		tOut.PutString ( sFile );
 		tOut.PutString ( RealPath ( sFile ) );
 		if ( !tOut.Commit() )
@@ -16803,7 +16877,7 @@ void HandleMysqlKill ( RowBuffer_i& tOut, int iKill )
 
 	if ( !iKilled )
 	{
-		tOut.ErrorEx ( SphSprintf ( "Unknown connection id: %d", iKill ).cstr(), MYSQL_ERR_NO_SUCH_THREAD );
+		tOut.ErrorEx ( SphSprintf ( "Unknown connection id: %d", iKill ).cstr(), EMYSQL_ERR::NO_SUCH_THREAD );
 	} else
 	{
 		tOut.Ok ( iKilled );
@@ -16968,6 +17042,9 @@ bool ClientSession_c::Execute ( Str_t sQuery, RowBuffer_i & tOut )
 
 			StatCountCommand ( SEARCHD_COMMAND_SEARCH );
 			SearchHandler_c tHandler ( 1, sphCreatePlainQueryParser(), QUERY_SQL, true );
+			// no log for search queries from the buddy in the info verbosity
+			if ( session::IsQueryLogDisabled() )
+				dStmt.Begin()->m_tQuery.m_uDebugFlags |= QUERY_DEBUG_NO_LOG;
 			tHandler.SetQuery ( 0, dStmt.Begin()->m_tQuery, std::move ( dStmt.Begin()->m_pTableFunc ) );
 			tHandler.m_pStmt = pStmt;
 
@@ -17343,7 +17420,7 @@ bool ClientSession_c::Execute ( Str_t sQuery, RowBuffer_i & tOut )
 		return true;
 
 	case STMT_FREEZE:
-		HandleMysqlFreezeIndexes ( tOut, pStmt->m_sIndex, m_tLastMeta.m_sWarning);
+		HandleMysqlFreezeIndexes ( tOut, *pStmt, m_tLastMeta.m_sWarning);
 		return true;
 
 	case STMT_UNFREEZE:
@@ -18308,7 +18385,7 @@ void ConfigureLocalIndex ( ServedDesc_t * pIdx, const CSphConfigSection & hIndex
 	pIdx->m_sGlobalIDFPath = hIndex.GetStr ( "global_idf" );
 }
 
-void ConfigureDistributedIndex ( std::function<bool(const CSphString&)>&& fnCheck, DistributedIndex_t & tIdx, const char * szIndexName, const CSphConfigSection & hIndex, StrVec_t * pWarnings )
+bool ConfigureDistributedIndex ( std::function<bool(const CSphString&)>&& fnCheck, DistributedIndex_t & tIdx, const char * szIndexName, const CSphConfigSection & hIndex, CSphString & sError, StrVec_t * pWarnings )
 {
 	assert ( hIndex("type") && hIndex["type"]=="distributed" );
 
@@ -18339,7 +18416,8 @@ void ConfigureDistributedIndex ( std::function<bool(const CSphString&)>&& fnChec
 			if ( !fnCheck ( sLocal ) )
 			{
 				sphWarning ( "table '%s': no such local table '%s', SKIPPED", szIndexName, sLocal.cstr() );
-				continue;
+				sError.SetSprintf ( "no such local table '%s'", sLocal.cstr() );
+				return false;
 			}
 			tIdx.m_dLocal.Add ( sLocal );
 		}
@@ -18384,9 +18462,11 @@ void ConfigureDistributedIndex ( std::function<bool(const CSphString&)>&& fnChec
 		for ( CSphVariant * pAgentCnf = hIndex ( tAg.sSect ); pAgentCnf; pAgentCnf = pAgentCnf->m_pNext )
 		{
 			AgentOptions_t tAgentOptions { tAg.bBlh, tAg.bPrs, tIdx.m_eHaStrategy, tIdx.m_iAgentRetryCount, 0 };
-			auto pAgent = ConfigureMultiAgent ( pAgentCnf->cstr(), szIndexName, tAgentOptions, pWarnings );
-			if ( pAgent )
-				tIdx.m_dAgents.Add ( pAgent );
+			auto pAgent = ConfigureMultiAgent ( pAgentCnf->cstr(), szIndexName, tAgentOptions, sError, pWarnings );
+			if ( !pAgent )
+				return false;
+
+			tIdx.m_dAgents.Add ( pAgent );
 		}
 	}
 
@@ -18414,6 +18494,8 @@ void ConfigureDistributedIndex ( std::function<bool(const CSphString&)>&& fnChec
 	// configure ha_strategy
 	if ( bSetHA && !bHaveHA )
 		sphWarning ( "table '%s': ha_strategy defined, but no ha agents in the table", szIndexName );
+
+	return true;
 }
 
 //////////////////////////////////////////////////
@@ -18423,11 +18505,14 @@ void ConfigureDistributedIndex ( std::function<bool(const CSphString&)>&& fnChec
 static ResultAndIndex_t AddDistributedIndex ( const char * szIndexName, const CSphConfigSection & hIndex, CSphString & sError, StrVec_t * pWarnings=nullptr )
 {
 	DistributedIndexRefPtr_t pIdx ( new DistributedIndex_t );
-	ConfigureDistributedIndex ( [] ( const auto& sIdx ) { return g_pLocalIndexes->Contains ( sIdx ); }, *pIdx, szIndexName, hIndex, pWarnings );
+	bool bOk = ConfigureDistributedIndex ( [] ( const auto& sIdx ) { return g_pLocalIndexes->Contains ( sIdx ); }, *pIdx, szIndexName, hIndex, sError, pWarnings );
 
-	if ( pIdx->IsEmpty () )
+	if ( !bOk || pIdx->IsEmpty () )
 	{
-		sError.SetSprintf ( "table '%s': no valid local/remote tables in distributed table", szIndexName );
+		if ( !bOk )
+			sError.SetSprintf ( "table '%s': %s", szIndexName, sError.cstr() );
+		else
+			sError.SetSprintf ( "table '%s': no valid local/remote tables in distributed table", szIndexName );
 		return { ADD_ERROR, nullptr };
 	}
 
@@ -19746,13 +19831,28 @@ static void SetOptionSI ( const CSphConfigSection & hSearchd, bool bTestMode )
 			eState = SIDefault_e::DISABLED;
 		else
 			eState = SIDefault_e::ENABLED;
-	}
 
-	if ( eState!=SIDefault_e::DISABLED && !IsSecondaryLibLoaded() )
-		sphWarning ( "secondary_indexes set but failed to initialize secondary library: %s", g_sSecondaryError.cstr() );
+		if ( eState != SIDefault_e::DISABLED && !IsSecondaryLibLoaded() )
+			sphWarning ( "secondary_indexes set but failed to initialize secondary library: %s", g_sSecondaryError.cstr() );
+	}
 
 	SetSecondaryIndexDefault ( eState );
 }
+
+
+static void ConfigureMerge ( const CSphConfigSection & hSearchd )
+{
+	BuildBufferSettings_t tSettings;
+	tSettings.m_iBufferAttributes	= hSearchd.GetSize ( "merge_buffer_attributes",	tSettings.m_iBufferAttributes );
+	tSettings.m_iBufferColumnar		= hSearchd.GetSize ( "merge_buffer_columnar",	tSettings.m_iBufferColumnar );
+	tSettings.m_iBufferStorage		= hSearchd.GetSize ( "merge_buffer_storage",	tSettings.m_iBufferStorage );
+	tSettings.m_iBufferFulltext		= hSearchd.GetSize ( "merge_buffer_fulltext",	tSettings.m_iBufferFulltext );
+	tSettings.m_iBufferDict			= hSearchd.GetSize ( "merge_buffer_dict",		tSettings.m_iBufferDict );
+	tSettings.m_iSIMemLimit			= hSearchd.GetSize ( "merge_si_memlimit",		tSettings.m_iSIMemLimit );
+
+	SetMergeSettings(tSettings);
+}
+
 
 void ConfigureSearchd ( const CSphConfig & hConf, bool bOptPIDFile, bool bTestMode ) REQUIRES ( MainThread )
 {
@@ -20019,6 +20119,8 @@ void ConfigureSearchd ( const CSphConfig & hConf, bool bOptPIDFile, bool bTestMo
 
 	SetAccurateAggregationDefault ( hSearchd.GetInt ( "accurate_aggregation", GetAccurateAggregationDefault() )!=0 );
 	SetDistinctThreshDefault ( hSearchd.GetInt ( "distinct_precision_threshold", GetDistinctThreshDefault() ) );
+
+	ConfigureMerge(hSearchd);
 }
 
 static void DirMustWritable ( const CSphString & sDataDir )
@@ -21341,10 +21443,11 @@ int WINAPI ServiceMain ( int argc, char **argv ) EXCLUDES (MainThread)
 	// time for replication to sync with cluster
 	searchd::AddShutdownCb ( ReplicationServiceShutdown );
 	ReplicationServiceStart ( bNewCluster || bNewClusterForce );
-	searchd::AddShutdownCb ( BuddyStop );
+	searchd::AddShutdownCb ( BuddyShutdown );
 	// --test should not guess buddy path
 	// otherwise daemon generates warning message that counts as bad daemon restart by ubertest
-	BuddyStart ( g_sBuddyPath, ( g_bHasBuddyPath || bTestMode ), dListenerDescs, g_bTelemetry, g_iThreads );
+	if ( !bTestMode )
+		BuddyStart ( g_sBuddyPath, PluginGetDir(), g_bHasBuddyPath, dListenerDescs, g_bTelemetry, g_iThreads, g_sConfigFile, RealPath ( GetDataDirInt() ) );
 
 	g_bJsonConfigLoadedOk = true;
 
